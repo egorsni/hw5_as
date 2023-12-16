@@ -1,5 +1,5 @@
-from hw_asr.loss.CTCLossWrapper import CTCLossWrapper as CTCLoss
+from hw_asr.loss.ce_loss import CELoss
 
 __all__ = [
-    "CTCLoss"
+    "CELoss"
 ]

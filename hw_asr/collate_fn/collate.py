@@ -1,6 +1,7 @@
 import logging
 from typing import List
 import torch
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -18,35 +19,23 @@ def collate_fn(dataset_items: List[dict]):
 #     print(dataset_items[0]['spectrogram'].shape)
 #     print(dataset_items[1]['spectrogram'].shape)
 #     print(dataset_items[2]['spectrogram'].shape)
-    result_batch = {}
-    audio_length = []
-    spectrogram_length = []
-    texts_length = []
+    
+    audios_cropped = []
+    labels = []
     
     for item in dataset_items:
-        audio_length.append(item['audio'].shape[1])
-        spectrogram_length.append(item['spectrogram'].shape[2])
-        texts_length.append(item['text_encoded'].shape[1])
+        audio = item["audio"][0].tolist()
         
-    audios = torch.zeros((len(audio_length), max(audio_length)))
-    spectrograms = torch.zeros((len(audio_length), 128, max(spectrogram_length)))
-    texts_encoded = torch.zeros((len(audio_length), max(texts_length)))
-    texts = []
-    paths = []
-    
-    for i, item in enumerate(dataset_items):
-        audios[i, :audio_length[i]] = item['audio']
-        spectrograms[i,:, :spectrogram_length[i]] = item['spectrogram']
-        texts_encoded[i, :texts_length[i]] = item['text_encoded']
-        texts.append(item['text'])
-        paths.append(item['audio_path'])
+        if len(audio) > 64000:
+            start = np.random.randint(low = 0, high = len(audio) - 64000)
+            audios_cropped.append(audio[start:start+64000])
+        else:
+            audio = np.tile(audio, 64000 // len(audio) + 10)[:64000]
+            audios_cropped.append(audio)
+            
+        labels.append(1 if item['label'] == 'bonafide' else 0)
     
     return {
-        "audio" : audios,
-        "spectrogram" : spectrograms,
-        "text" : texts,
-        "text_encoded" : texts_encoded,
-        "text_encoded_length" : torch.tensor(texts_length),
-        "spectrogram_length" : torch.tensor(spectrogram_length),
-        "audio_path" : paths
+        "audios" : torch.tensor(audios_cropped),
+        "labels" : torch.tensor(labels)
             }

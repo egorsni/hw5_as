@@ -13,8 +13,14 @@ from tqdm import tqdm
 from hw_asr.base import BaseTrainer
 from hw_asr.base.base_text_encoder import BaseTextEncoder
 from hw_asr.logger.utils import plot_spectrogram_to_buf
-from hw_asr.metric.utils import calc_cer, calc_wer
 from hw_asr.utils import inf_loop, MetricTracker
+
+from hw_asr.metric.eer_metric import EERMetric
+
+from hw_asr.metric.eer_metric import compute_eer
+
+import torch.nn as nn
+
 
 
 class Trainer(BaseTrainer):
@@ -31,14 +37,12 @@ class Trainer(BaseTrainer):
             config,
             device,
             dataloaders,
-            text_encoder,
             lr_scheduler=None,
             len_epoch=None,
             skip_oom=True,
     ):
         super().__init__(model, criterion, metrics, optimizer, config, device)
         self.skip_oom = skip_oom
-        self.text_encoder = text_encoder
         self.config = config
         self.train_dataloader = dataloaders["train"]
         if len_epoch is None:
@@ -49,14 +53,14 @@ class Trainer(BaseTrainer):
             self.train_dataloader = inf_loop(self.train_dataloader)
             self.len_epoch = len_epoch
         self.evaluation_dataloaders = {k: v for k, v in dataloaders.items() if k != "train"}
-        self.lr_scheduler = lr_scheduler
-        self.log_step = 50
+        self.lr_scheduler = None
+        self.log_step = 50 #ALERT!! 50
 
         self.train_metrics = MetricTracker(
-            "loss", "grad norm", *[m.name for m in self.metrics], writer=self.writer
+            "loss", "grad norm", writer=self.writer
         )
         self.evaluation_metrics = MetricTracker(
-            "loss", *[m.name for m in self.metrics], writer=self.writer
+            "loss", writer=self.writer
         )
 
     @staticmethod
@@ -64,7 +68,7 @@ class Trainer(BaseTrainer):
         """
         Move all necessary tensors to the HPU
         """
-        for tensor_for_gpu in ["spectrogram", "text_encoded"]:
+        for tensor_for_gpu in ["audios", "labels"]:
             batch[tensor_for_gpu] = batch[tensor_for_gpu].to(device)
         return batch
 
@@ -84,6 +88,8 @@ class Trainer(BaseTrainer):
         self.model.train()
         self.train_metrics.reset()
         self.writer.add_scalar("epoch", epoch)
+        all_outputs = None
+        all_labels = None
         for batch_idx, batch in enumerate(
                 tqdm(self.train_dataloader, desc="train", total=self.len_epoch)
         ):
@@ -111,18 +117,26 @@ class Trainer(BaseTrainer):
                         epoch, self._progress(batch_idx), batch["loss"].item()
                     )
                 )
-                self.writer.add_scalar(
+                if self.lr_scheduler is not None:
+                    self.writer.add_scalar(
                     "learning rate", self.lr_scheduler.get_last_lr()[0]
-                )
-                self._log_predictions(**batch)
-                self._log_spectrogram(batch["spectrogram"])
+                    )
                 self._log_scalars(self.train_metrics)
                 # we don't want to reset train metrics at the start of every epoch
                 # because we are interested in recent train metrics
                 last_train_metrics = self.train_metrics.result()
                 self.train_metrics.reset()
+            all_outputs = torch.concat((all_outputs, batch['outputs'])) if all_outputs is not None else batch['outputs']
+            all_labels = torch.concat((all_labels, batch['labels'])) if all_labels is not None else batch['labels']
             if batch_idx >= self.len_epoch:
                 break
+        all_outputs = torch.nn.functional.log_softmax(all_outputs, dim=-1)[:, 1]
+        eer, thres = compute_eer(
+                bonafide_scores=all_outputs[all_labels == 1].detach().cpu().numpy(),
+                other_scores=all_outputs[all_labels == 0].detach().cpu().numpy())
+        print('EER_train', eer)
+        
+        self.writer.add_scalar(f"EER_train", eer)
         log = last_train_metrics
 
         for part, dataloader in self.evaluation_dataloaders.items():
@@ -135,17 +149,11 @@ class Trainer(BaseTrainer):
         batch = self.move_batch_to_device(batch, self.device)
         if is_train:
             self.optimizer.zero_grad()
-        outputs = self.model(**batch)
-        if type(outputs) is dict:
-            batch.update(outputs)
-        else:
-            batch["logits"] = outputs
+        outputs = self.model(batch['audios'])
 
-        batch["log_probs"] = F.log_softmax(batch["logits"], dim=-1)
-        batch["log_probs_length"] = self.model.transform_input_lengths(
-            batch["spectrogram_length"]
-        )
-        batch["loss"] = self.criterion(**batch)
+        batch['outputs'] = outputs
+#         print(outputs)
+        batch['loss'] = self.criterion(outputs, batch['labels'].to(dtype=torch.long))
         if is_train:
             batch["loss"].backward()
             self._clip_grad_norm()
@@ -154,8 +162,8 @@ class Trainer(BaseTrainer):
                 self.lr_scheduler.step()
 
         metrics.update("loss", batch["loss"].item())
-        for met in self.metrics:
-            metrics.update(met.name, met(**batch))
+#         for met in self.metrics:
+#             metrics.update(met.name, met(**batch))
         return batch
 
     def _evaluation_epoch(self, epoch, part, dataloader):
@@ -167,6 +175,8 @@ class Trainer(BaseTrainer):
         """
         self.model.eval()
         self.evaluation_metrics.reset()
+        all_outputs = None
+        all_labels = None
         with torch.no_grad():
             for batch_idx, batch in tqdm(
                     enumerate(dataloader),
@@ -178,14 +188,22 @@ class Trainer(BaseTrainer):
                     is_train=False,
                     metrics=self.evaluation_metrics,
                 )
+                all_outputs = torch.concat((all_outputs, batch['outputs'])) if all_outputs is not None else batch['outputs']
+                all_labels = torch.concat((all_labels, batch['labels'])) if all_labels is not None else batch['labels']
             self.writer.set_step(epoch * self.len_epoch, part)
             self._log_scalars(self.evaluation_metrics)
-            self._log_predictions(**batch)
-            self._log_spectrogram(batch["spectrogram"])
-
+#             self._log_predictions(**batch)
+#             self._log_spectrogram(batch["spectrogram"])
+            all_outputs = torch.nn.functional.log_softmax(all_outputs, dim=-1)[:, 1]
+            eer, thres = compute_eer(
+                bonafide_scores=all_outputs[all_labels == 1].detach().cpu().numpy(),
+                other_scores=all_outputs[all_labels == 0].detach().cpu().numpy())
+        print(f'EER_{part}', eer)
+        
+        self.writer.add_scalar(f'EER_{part}', eer)
         # add histogram of model parameters to the tensorboard
-        for name, p in self.model.named_parameters():
-            self.writer.add_histogram(name, p, bins="auto")
+#         for name, p in self.model.named_parameters():
+#             self.writer.add_histogram(name, p, bins="auto")
         return self.evaluation_metrics.result()
 
     def _progress(self, batch_idx):

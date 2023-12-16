@@ -112,3 +112,6 @@ wandb/
 __MACOSX/
 
 kenlm/
+
+LA/
+*.pth

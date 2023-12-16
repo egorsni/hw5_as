@@ -22,18 +22,24 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(SEED)
 
+def _get_ft_model(self, finetuing_path):
+        finetuing_path = str(finetuing_path)
+        self.logger.info("Loading checkpoint: {} ...".format(finetuing_path))
+        checkpoint = torch.load(finetuing_path, self.device)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.logger.info(
+            "Checkpoint loaded."
+        )
+
 
 def main(config):
     logger = config.get_logger("train")
 
-    # text_encoder
-    text_encoder = config.get_text_encoder()
-
     # setup data_loader instances
-    dataloaders = get_dataloaders(config, text_encoder)
+    dataloaders = get_dataloaders(config)
 
     # build model architecture, then print to console
-    model = config.init_obj(config["arch"], module_arch, n_class=len(text_encoder))
+    model = config.init_obj(config["arch"], module_arch)
     logger.info(model)
 
     # prepare for (multi-device) GPU training
@@ -45,7 +51,7 @@ def main(config):
     # get function handles of loss and metrics
     loss_module = config.init_obj(config["loss"], module_loss).to(device)
     metrics = [
-        config.init_obj(metric_dict, module_metric, text_encoder=text_encoder)
+        config.init_obj(metric_dict, module_metric)
         for metric_dict in config["metrics"]
     ]
 
@@ -60,7 +66,6 @@ def main(config):
         loss_module,
         metrics,
         optimizer,
-        text_encoder=text_encoder,
         config=config,
         device=device,
         dataloaders=dataloaders,
@@ -93,6 +98,13 @@ if __name__ == "__main__":
         default=None,
         type=str,
         help="indices of GPUs to enable (default: all)",
+    )
+    args.add_argument(
+        "-f",
+        "--finetune",
+        default=None,
+        type=str,
+        help="path to pretrained model checkpoint (default: None)",
     )
 
     # custom cli options to modify configuration from default values given in json file.
